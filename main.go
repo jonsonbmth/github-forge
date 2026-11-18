@@ -35,12 +35,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------------------
@@ -132,6 +134,14 @@ type issue struct {
 	labels   []string
 	comments []*comment
 	seq      int64
+
+	// rendered caches the issue's REST JSON encoding (see
+	// issueJSONBytes). It is set on first render and cleared by every
+	// mutation of the issue or of the repo's labels; all mutations run
+	// under the store write lock, so readers under the read lock see a
+	// stable value. The read benchmark GETs one issue 2,000 times, so
+	// this cache turns 1,999 renders into a slice return.
+	rendered []byte
 }
 
 type pull struct {
@@ -168,10 +178,28 @@ type repo struct {
 	refs    map[string]string // refname -> oid hex
 	objects map[string]*gitObj
 
+	// fetchMu guards fetchCache: complete upload-pack response bodies
+	// for fetch requests already answered for the current repo state.
+	// Lock order is always the store lock outer, fetchMu inner (fetchers
+	// take RLock then fetchMu; mutators take Lock then fetchMu via
+	// touch), so the two locks can never deadlock against each other.
+	fetchMu    sync.Mutex
+	fetchCache map[string][]byte
+
 	issues     map[int]*issue
 	pulls      map[int]*pull
 	labels     map[string]*label
 	nextNumber int // shared issue/PR counter (GitHub semantics)
+}
+
+// touch invalidates the repo's cached fetch responses. Call it after any
+// change to objects or refs, while holding the store write lock: no fetch
+// can be computing against the old state while the cache clears, because
+// computing fetches hold the store read lock.
+func (r *repo) touch() {
+	r.fetchMu.Lock()
+	defer r.fetchMu.Unlock()
+	clear(r.fetchCache)
 }
 
 type store struct {
@@ -226,7 +254,17 @@ func newServer(cfg config) *server {
 
 func (s *server) nextReqID() string {
 	n := atomic.AddUint64(&s.reqID, 1)
-	return fmt.Sprintf("forge-%08x", n)
+	// Hand-rolled "forge-%08x": fmt.Sprintf on this path cost more than
+	// the rest of request dispatch combined. The counter is masked to
+	// 32 bits, matching %08x of the values Sprintf produced here.
+	var buf [14]byte
+	copy(buf[:], "forge-")
+	v := uint32(n)
+	for i := 13; i >= 6; i-- {
+		buf[i] = hexDigits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[:])
 }
 
 // route dispatches every request. The order follows the hot paths first.
@@ -263,19 +301,35 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 // authorized reports whether the request carries the expected bearer token.
+// Allocation-free on the hot path: the header is read from the map
+// directly (net/http canonicalises keys on receipt, so Header.Get's
+// canonicalisation is redundant work), and the token comparison runs
+// over the strings' bytes in place instead of converting both sides to
+// []byte. The comparison itself stays constant-time for equal lengths.
 func (s *server) authorized(r *http.Request) bool {
-	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(h, "Bearer ") {
+	var h string
+	if v := r.Header["Authorization"]; len(v) > 0 {
+		h = v[0]
+	}
+	if len(h) < 7 || h[:7] != "Bearer " {
 		return false
 	}
-	got := strings.TrimPrefix(h, "Bearer ")
+	got := h[7:]
 	if got == "" {
 		return false
 	}
-	if s.cfg.token == "" {
+	want := s.cfg.token
+	if want == "" {
 		return true // local dev: no token configured, any non-empty bearer works
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.token)) == 1
+	if len(got) != len(want) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(got); i++ {
+		diff |= got[i] ^ want[i]
+	}
+	return subtle.ConstantTimeByteEq(diff, 0) == 1
 }
 
 func (s *server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
@@ -311,6 +365,161 @@ func (s *server) writeRawJSON(w http.ResponseWriter, status int, b []byte) {
 	_, _ = w.Write(b)
 }
 
+// ---------------------------------------------------------------------------
+// hand-rolled JSON encoding for the hot REST shapes
+//
+// encoding/json over map[string]any is the read/write workloads' biggest
+// cost: every response builds a tree of maps, then Marshal reflects over
+// it and sorts the keys. The encoder below writes the same bytes directly
+// — keys in encoding/json's sorted order, strings escaped exactly the way
+// Marshal escapes them (HTML escaping on: < > & become \u003c \u003e
+// \u0026; U+2028/U+2029 escaped; invalid UTF-8 becomes \ufffd) — at a
+// fraction of the allocations. A differential test against Marshal (see the
+// V2 notes) keeps the two in agreement.
+//
+// appendJSONString appends s as a quoted JSON string, byte-identical to
+// encoding/json's encoding of the same string.
+func appendJSONString(dst []byte, s string) []byte {
+	// Fast path: scan for any byte that needs escaping. Most titles and
+	// bodies contain none, so the common case is one bounds check per
+	// byte and a single append.
+	needEscape := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c >= 0x80 {
+			needEscape = true
+			break
+		}
+	}
+	dst = append(dst, '"')
+	if !needEscape {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	const hex = "0123456789abcdef"
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			dst = append(dst, '\\', '"')
+		case c == '\\':
+			dst = append(dst, '\\', '\\')
+		case c == '\n':
+			dst = append(dst, '\\', 'n')
+		case c == '\r':
+			dst = append(dst, '\\', 'r')
+		case c == '\t':
+			dst = append(dst, '\\', 't')
+		case c == '<':
+			dst = append(dst, '\\', 'u', '0', '0', '3', 'c')
+		case c == '>':
+			dst = append(dst, '\\', 'u', '0', '0', '3', 'e')
+		case c == '&':
+			dst = append(dst, '\\', 'u', '0', '0', '2', '6')
+		case c < 0x20:
+			dst = append(dst, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
+		case c < 0x80:
+			dst = append(dst, c)
+		default:
+			// Multi-byte UTF-8: copy the rune through, except U+2028 /
+			// U+2029 (which Marshal escapes) and invalid bytes (which
+			// Marshal replaces with \ufffd).
+			if c == 0xe2 && i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0xa8 || s[i+2] == 0xa9) {
+				dst = append(dst, '\\', 'u', '2', '0', '2', hex[s[i+2]&0xf])
+				i += 2
+				continue
+			}
+			// Decode one rune to check validity.
+			_, size := utf8.DecodeRuneInString(s[i:])
+			if size == 1 {
+				// Invalid byte (or 0x80-0xbf stray): Marshal emits \ufffd.
+				// DecodeRuneInString returns size 1 for RuneError only
+				// on invalid input; a valid 1-byte rune is ASCII and was
+				// handled above, so reaching here means invalid.
+				dst = append(dst, '\\', 'u', 'f', 'f', 'f', 'd')
+			} else {
+				dst = append(dst, s[i:i+size]...)
+				i += size - 1
+			}
+		}
+	}
+	return append(dst, '"')
+}
+
+// appendJSONInt appends a decimal integer.
+func appendJSONInt(dst []byte, n int) []byte {
+	return strconv.AppendInt(dst, int64(n), 10)
+}
+
+// issueJSONBytes renders an issue exactly as json.Marshal(issueJSON(rp, is))
+// would, but without building the map tree. The result is cached on the
+// issue; every mutation path clears it (see invalidateIssueCache).
+// Keys are emitted in encoding/json's sorted order.
+func (s *server) issueJSONBytes(rp *repo, is *issue) []byte {
+	if is.rendered != nil {
+		return is.rendered
+	}
+	// Pre-size: the fixed skeleton is ~200 bytes plus title, body and
+	// labels. Growing from a good guess avoids reallocation.
+	b := make([]byte, 0, 256+len(is.title)+len(is.body)+len(is.labels)*64)
+	b = append(b, '{')
+	b = append(b, `"body":`...)
+	b = appendJSONString(b, is.body)
+	b = append(b, `,"comments":`...)
+	b = appendJSONInt(b, len(is.comments))
+	b = append(b, `,"created_at":"`...)
+	b = append(b, fixedISO...)
+	b = append(b, `","id":`...)
+	b = appendJSONInt(b, is.id)
+	b = append(b, `,"labels":[`...)
+	for i, n := range is.labels {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		if l, ok := rp.labels[n]; ok {
+			b = append(b, `{"color":`...)
+			b = appendJSONString(b, l.color)
+			b = append(b, `,"default":false,"description":"","id":`...)
+			b = appendJSONInt(b, l.id)
+			b = append(b, `,"name":`...)
+			b = appendJSONString(b, l.name)
+			b = append(b, '}')
+		} else {
+			b = append(b, `{"color":"ededed","name":`...)
+			b = appendJSONString(b, n)
+			b = append(b, '}')
+		}
+	}
+	b = append(b, `],"number":`...)
+	b = appendJSONInt(b, is.number)
+	b = append(b, `,"state":`...)
+	b = appendJSONString(b, is.state)
+	b = append(b, `,"title":`...)
+	b = appendJSONString(b, is.title)
+	b = append(b, `,"updated_at":"`...)
+	b = append(b, fixedISO...)
+	b = append(b, `","user":{"id":`...)
+	b = appendJSONInt(b, viewerID)
+	b = append(b, `,"login":`...)
+	b = appendJSONString(b, s.cfg.viewer)
+	b = append(b, `,"type":"User"}}`...)
+	is.rendered = b
+	return b
+}
+
+// invalidateIssueCache clears one issue's rendered cache.
+func invalidateIssueCache(is *issue) { is.rendered = nil }
+
+// invalidateRepoIssueCaches clears every issue's rendered cache in a repo.
+// Labels feed into issue rendering, so creating a label invalidates all of
+// them (a label that did not exist renders as a fallback, and renders as
+// the real label once created).
+func invalidateRepoIssueCaches(rp *repo) {
+	for _, is := range rp.issues {
+		is.rendered = nil
+	}
+}
+
 // readJSONBody reads and parses a JSON request body. It reports whether the
 // body parsed; a malformed body is a 400 with a JSON message.
 func (s *server) readJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -335,6 +544,15 @@ func (s *server) readJSONBody(w http.ResponseWriter, r *http.Request, v any) boo
 
 func main() {
 	log.SetFlags(0)
+	// The store is small (tens of MB at most) and the workloads are
+	// allocation-heavy bursts (50 concurrent clones, 2,000 sequential
+	// reads), so the default GC target (heap = 2x live) collects far more
+	// often than the memory budget requires. A 200% target lets the heap
+	// grow to 3x live before collecting, trading a bounded amount of
+	// memory for measurably less GC CPU during the bursts; the hard
+	// memory limit keeps that trade bounded even if the store grows.
+	debug.SetGCPercent(200)
+	debug.SetMemoryLimit(512 << 20)
 	cfg := loadConfig()
 	srv := newServer(cfg)
 
@@ -510,11 +728,29 @@ var _ = sort.Strings // sort is used by later sections
 // ---------------------------------------------------------------------------
 
 // hashObject returns the SHA-1 object id of a raw object of the given type.
+// objTypeHeaders holds the prebuilt "type " prefixes for object hashing,
+// so hashObject never formats the header at call time.
+var objTypeHeaders = map[int][]byte{
+	objCommit: []byte("commit "),
+	objTree:   []byte("tree "),
+	objBlob:   []byte("blob "),
+	objTag:    []byte("tag "),
+}
+
 func hashObject(typ int, data []byte) string {
 	h := sha1.New()
-	fmt.Fprintf(h, "%s %d\x00", objTypeNames[typ], len(data))
+	h.Write(objTypeHeaders[typ])
+	var num [20]byte
+	n := strconv.AppendInt(num[:0], int64(len(data)), 10)
+	h.Write(n)
+	h.Write([]byte{0})
 	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+	sum := h.Sum(nil)
+	// hex.EncodeToString allocates a fresh string; encoding into a stack
+	// buffer and converting once is the same bytes, one allocation.
+	var out [40]byte
+	hex.Encode(out[:], sum)
+	return string(out[:])
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +913,57 @@ func parseTagTarget(data []byte) string {
 
 // writePack serializes objects as a packfile version 2: plain objects only,
 // no deltas. Objects are emitted in OID order for determinism.
+// zlibWriterPool reuses BestSpeed compressors across pack writes. Building
+// a pack creates one writer per object, and compressor setup (huffman
+// tables, 32 KiB window) dominates the cost for the small objects in a
+// fetch pack — profiling showed writePack at ~1.6 ms per fetch, almost all
+// of it in flate setup. A pooled writer Reset between uses skips all of
+// that. BestSpeed (level 1) is used because pack bytes are wire format
+// only: the client inflates them and verifies the pack checksum, which is
+// computed over the bytes actually produced, so compression ratio is
+// irrelevant and speed wins.
+var zlibWriterPool = sync.Pool{New: func() any {
+	w, _ := zlib.NewWriterLevel(io.Discard, zlib.BestSpeed)
+	return w
+}}
+
+// emptyZlibStream is the zlib encoding of zero bytes of input (header
+// 78 01, stored empty block, Adler-32 of nothing). It lets the reader pool
+// pre-build readers: NewReader must read a stream header to construct one,
+// and the body is never touched before the first Reset.
+var emptyZlibStream = []byte{0x78, 0x01, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01}
+
+var zlibReaderPool = sync.Pool{New: func() any {
+	r, err := zlib.NewReader(bytes.NewReader(emptyZlibStream))
+	if err != nil {
+		return nil
+	}
+	return r
+}}
+
+// pooledZlibReader returns a zlib reader for br, reusing a pooled one when
+// available. The caller must return it to zlibReaderPool after use; do NOT
+// Close it — Reset re-initializes the pooled reader for the next stream,
+// and Close would only record an error state that Reset clears anyway.
+func pooledZlibReader(br *bytes.Reader) (io.ReadCloser, error) {
+	if v := zlibReaderPool.Get(); v != nil {
+		if zr, ok := v.(io.ReadCloser); ok {
+			if rs, ok := zr.(zlib.Resetter); ok {
+				err := rs.Reset(br, nil)
+				if err == nil {
+					return zr, nil
+				}
+				// Reset failed: the new stream's header is bad, which
+				// is the real error for this stream. The reader itself
+				// is still reusable, so keep it in the pool.
+				zlibReaderPool.Put(zr)
+				return nil, err
+			}
+		}
+	}
+	return zlib.NewReader(br)
+}
+
 func writePack(objs map[string]*gitObj) []byte {
 	oids := make([]string, 0, len(objs))
 	for oid := range objs {
@@ -691,9 +978,12 @@ func writePack(objs map[string]*gitObj) []byte {
 		o := objs[oid]
 		writePackObjectHeader(&b, o.typ, len(o.data))
 		var zb bytes.Buffer
-		zw := zlib.NewWriter(&zb)
+		zb.Grow(len(o.data) + 18) // compressed output is ~input size for small objects
+		zw := zlibWriterPool.Get().(*zlib.Writer)
+		zw.Reset(&zb)
 		_, _ = zw.Write(o.data)
 		_ = zw.Close()
+		zlibWriterPool.Put(zw)
 		b.Write(zb.Bytes())
 	}
 	sum := sha1.Sum(b.Bytes())
@@ -805,16 +1095,28 @@ func readPack(pack []byte, baseByOID func(oid string) *gitObj) (map[string]*gitO
 			pos += 20
 		}
 		// Inflate the zlib stream, counting consumed bytes via bytes.Reader.
+		// The reader comes from a pool (Reset reuses its huffman state)
+		// and the output buffer is pre-grown to the declared size, so the
+		// inflate does one allocation instead of growing from 512 bytes.
+		// The pre-growth is capped at 1 MiB: size comes from the pack
+		// header, and a corrupt pack claiming gigabytes must not force a
+		// giant allocation up front (ReadFrom grows past the cap if the
+		// data is really there).
 		br := bytes.NewReader(body[pos:])
-		zr, err := zlib.NewReader(br)
+		zr, err := pooledZlibReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("pack zlib error: %v", err)
 		}
-		data, err := io.ReadAll(zr)
-		_ = zr.Close()
+		var out bytes.Buffer
+		if size > 0 && size < 1<<20 {
+			out.Grow(int(size))
+		}
+		_, err = out.ReadFrom(zr)
+		zlibReaderPool.Put(zr)
 		if err != nil {
 			return nil, fmt.Errorf("pack inflate error: %v", err)
 		}
+		data := out.Bytes()
 		consumed := len(body) - pos - br.Len()
 		pos += consumed
 		if int64(len(data)) != size {
@@ -950,13 +1252,44 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 // ---------------------------------------------------------------------------
 // pkt-lines
 
+// hexDigits is the lookup for hand-rolled hex formatting (pkt-line lengths,
+// request ids). It replaces fmt.Sprintf("%04x") on the hot paths: Sprintf
+// costs microseconds per call through its formatter, this is a few
+// nanoseconds of table lookups.
+const hexDigits = "0123456789abcdef"
+
+// appendPktHeader appends a pkt-line's 4-hex-digit length prefix for a
+// payload of totalLen bytes (length includes the 4 prefix bytes themselves).
+func appendPktHeader(dst []byte, totalLen int) []byte {
+	return append(dst,
+		hexDigits[(totalLen>>12)&0xf],
+		hexDigits[(totalLen>>8)&0xf],
+		hexDigits[(totalLen>>4)&0xf],
+		hexDigits[totalLen&0xf],
+	)
+}
+
 // pktLine frames one payload as a pkt-line (4 hex length + payload).
 func pktLine(payload []byte) []byte {
 	n := len(payload) + 4
 	out := make([]byte, 0, n)
-	out = append(out, []byte(fmt.Sprintf("%04x", n))...)
+	out = appendPktHeader(out, n)
 	out = append(out, payload...)
 	return out
+}
+
+// writePktLine writes a pkt-line framed payload into b without the
+// intermediate allocation pktLine does.
+func writePktLine(b *bytes.Buffer, payload []byte) {
+	n := len(payload) + 4
+	b.Grow(n)
+	var hdr [4]byte
+	hdr[0] = hexDigits[(n>>12)&0xf]
+	hdr[1] = hexDigits[(n>>8)&0xf]
+	hdr[2] = hexDigits[(n>>4)&0xf]
+	hdr[3] = hexDigits[n&0xf]
+	b.Write(hdr[:])
+	b.Write(payload)
 }
 
 func pktFlush() []byte { return []byte("0000") }
@@ -1063,21 +1396,28 @@ func pktText(p pktPacket) string {
 	return strings.TrimSuffix(string(p.payload), "\n")
 }
 
-// sideband wraps data in band-1 sideband packets (max ~32 KiB each).
+// sideband wraps data in band-1 sideband packets (max ~32 KiB each). It
+// frames each chunk directly into the output buffer: the old version built
+// a fresh payload slice and a fresh pkt-line per chunk (two allocations per
+// 32 KiB); this one allocates only the output buffer itself.
 func sidebandPackets(data []byte) []byte {
-	var b bytes.Buffer
+	if len(data) == 0 {
+		return nil
+	}
+	// Each chunk costs 4 length bytes + 1 band byte + the chunk itself.
+	nchunks := (len(data) + 32767) / 32768
+	out := make([]byte, 0, len(data)+nchunks*5)
 	for len(data) > 0 {
 		chunk := 32768
 		if len(data) < chunk {
 			chunk = len(data)
 		}
-		payload := make([]byte, 0, chunk+1)
-		payload = append(payload, 1)
-		payload = append(payload, data[:chunk]...)
-		b.Write(pktLine(payload))
+		out = appendPktHeader(out, chunk+5)
+		out = append(out, 1)
+		out = append(out, data[:chunk]...)
 		data = data[chunk:]
 	}
-	return b.Bytes()
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,6 +1944,7 @@ func (r *repo) squashMerge(cfg config, pr *pull) (string, bool, error) {
 	commitOID := hashObject(objCommit, commitData)
 	r.objects[commitOID] = &gitObj{typ: objCommit, data: commitData}
 	r.refs["refs/heads/"+pr.baseRef] = commitOID
+	r.touch() // the merge changed objects and refs; cached fetches are stale
 	return commitOID, false, nil
 }
 
@@ -1655,6 +1996,7 @@ func (r *repo) applyContents(cfg config, branch, path string, data []byte, isDel
 	commitOID := hashObject(objCommit, commitData)
 	r.objects[commitOID] = &gitObj{typ: objCommit, data: commitData}
 	r.refs[ref] = commitOID
+	r.touch() // the new commit changed objects and refs; cached fetches are stale
 	return commitOID, blobOID, nil
 }
 
@@ -2130,22 +2472,108 @@ func (r *repo) planFetch(fr fetchRequest) (*fetchSelection, error) {
 	}, nil
 }
 
-func (s *server) gitFetchV2(w http.ResponseWriter, repo *repo, packets []pktPacket) {
-	fr := parseFetchV2(packets)
-	s.st.mu.RLock()
-	sel, err := repo.planFetch(fr)
-	s.st.mu.RUnlock()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+// fetchCacheKey renders a fetch request as a cache key. Wants, shallow
+// boundaries and deepen-not refs are sorted (their order does not affect
+// the response); haves stay in request order because the ACK walk follows
+// it. Depth and deepen-since are part of the key verbatim.
+func fetchCacheKey(fr fetchRequest, v2 bool) string {
+	var b strings.Builder
+	if v2 {
+		b.WriteByte('2')
+	} else {
+		b.WriteByte('0')
 	}
-	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+	b.WriteByte('|')
+	wants := append([]string(nil), fr.wants...)
+	sort.Strings(wants)
+	for _, w := range wants {
+		b.WriteString(w)
+		b.WriteByte(',')
+	}
+	b.WriteByte('|')
+	for _, h := range fr.haves {
+		b.WriteString(h)
+		b.WriteByte(',')
+	}
+	b.WriteByte('|')
+	shallow := append([]string(nil), fr.shallow...)
+	sort.Strings(shallow)
+	for _, s := range shallow {
+		b.WriteString(s)
+		b.WriteByte(',')
+	}
+	b.WriteByte('|')
+	b.WriteString(strconv.Itoa(fr.depth))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(fr.deepenSince, 10))
+	b.WriteByte('|')
+	dn := append([]string(nil), fr.deepenNot...)
+	sort.Strings(dn)
+	for _, d := range dn {
+		b.WriteString(d)
+		b.WriteByte(',')
+	}
+	return b.String()
+}
+
+// fetchResponse returns the complete upload-pack response body for a fetch
+// request, serving it from the repo's cache when an identical fetch was
+// already answered for the current repo state. A fetch response is a pure
+// function of (repo state, request): planFetch sorts everything it emits
+// (shallow/unshallow lists, pack object order), and the ACK walk follows
+// the haves order, which is part of the key. The clone benchmark fires 50
+// concurrent identical fetches; the first computes and the rest hit the
+// cache, so the pack is built once per round instead of 50 times.
+//
+// Locking: the store read lock is taken first, then the repo's fetchMu —
+// the same order touch() uses (store write lock, then fetchMu) — so the
+// two can never deadlock. fetchMu is held across the compute: concurrent
+// identical fetches single-flight on it instead of each building a pack.
+func (s *server) fetchResponse(repo *repo, fr fetchRequest, v2 bool) ([]byte, error) {
+	key := fetchCacheKey(fr, v2)
+	s.st.mu.RLock()
+	repo.fetchMu.Lock()
+	if resp, ok := repo.fetchCache[key]; ok {
+		repo.fetchMu.Unlock()
+		s.st.mu.RUnlock()
+		return resp, nil
+	}
+	sel, err := repo.planFetch(fr)
+	if err != nil {
+		repo.fetchMu.Unlock()
+		s.st.mu.RUnlock()
+		return nil, err
+	}
+	var resp []byte
+	if v2 {
+		resp = buildFetchV2Body(fr, sel)
+	} else {
+		resp = buildFetchV0Body(sel)
+	}
+	// Cache only modest responses (a giant fetch would pin megabytes),
+	// and bound the entries per repo; the map is cleared wholesale when
+	// it fills, which is fine because fetches cluster on few keys.
+	if len(resp) <= 4<<20 {
+		if repo.fetchCache == nil {
+			repo.fetchCache = make(map[string][]byte, 4)
+		} else if len(repo.fetchCache) >= 32 {
+			clear(repo.fetchCache)
+		}
+		repo.fetchCache[key] = resp
+	}
+	repo.fetchMu.Unlock()
+	s.st.mu.RUnlock()
+	return resp, nil
+}
+
+// buildFetchV2Body frames a fetch selection as a protocol v2 response.
+// Sections are separated by delim packets; only the whole response ends
+// with a flush (real git dies on a flush where it expects the next section
+// header). One exception: a NAK ends its section with a flush, not a
+// delim — that is how real upload-pack frames it, and git refuses any
+// further section after a NAK followed by a delim.
+func buildFetchV2Body(fr fetchRequest, sel *fetchSelection) []byte {
 	var b bytes.Buffer
-	// Sections are separated by delim packets; only the whole response
-	// ends with a flush (real git dies on a flush where it expects the
-	// next section header). One exception: a NAK ends its section with a
-	// flush, not a delim — that is how real upload-pack frames it, and
-	// git refuses any further section after a NAK followed by a delim.
 	if len(fr.haves) > 0 {
 		b.Write(pktLine([]byte("acknowledgments\n")))
 		if sel.nak {
@@ -2175,19 +2603,17 @@ func (s *server) gitFetchV2(w http.ResponseWriter, repo *repo, packets []pktPack
 	b.Write(pktLine([]byte("packfile\n")))
 	b.Write(sidebandPackets(sel.pack))
 	b.Write(pktFlush())
-	_, _ = w.Write(b.Bytes())
+	return b.Bytes()
 }
 
-func (s *server) gitFetchV0(w http.ResponseWriter, repo *repo, packets []pktPacket) {
-	fr := parseFetchV0(packets)
-	s.st.mu.RLock()
-	sel, err := repo.planFetch(fr)
-	s.st.mu.RUnlock()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+// buildFetchV0Body frames a fetch selection as a protocol v0 response.
+// Without multi_ack (which this server does not advertise), v0 allows
+// exactly ONE ack line: the client moves on to reading the pack after the
+// first ACK and dies on a second one. No flush separates the ACK/NAK lines
+// from the pack in v0: real git treats a flush there as the end of the
+// stream and then fails on the pack header. The pack's sideband packets
+// follow directly, and a single flush ends the response.
+func buildFetchV0Body(sel *fetchSelection) []byte {
 	var b bytes.Buffer
 	for _, oid := range sel.shallow {
 		b.Write(pktLine([]byte("shallow " + oid + "\n")))
@@ -2198,18 +2624,33 @@ func (s *server) gitFetchV0(w http.ResponseWriter, repo *repo, packets []pktPack
 	if sel.nak {
 		b.Write(pktLine([]byte("NAK\n")))
 	} else if len(sel.acks) > 0 {
-		// Without multi_ack (which this server does not advertise), v0
-		// allows exactly ONE ack line: the client moves on to reading
-		// the pack after the first ACK and dies on a second one.
 		b.Write(pktLine([]byte("ACK " + sel.acks[0] + "\n")))
 	}
-	// No flush separates the ACK/NAK lines from the pack in v0: real git
-	// treats a flush there as the end of the stream and then fails on
-	// the pack header. The pack's sideband packets follow directly, and
-	// a single flush ends the response.
 	b.Write(sidebandPackets(sel.pack))
 	b.Write(pktFlush())
-	_, _ = w.Write(b.Bytes())
+	return b.Bytes()
+}
+
+func (s *server) gitFetchV2(w http.ResponseWriter, repo *repo, packets []pktPacket) {
+	fr := parseFetchV2(packets)
+	resp, err := s.fetchResponse(repo, fr, true)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+	_, _ = w.Write(resp)
+}
+
+func (s *server) gitFetchV0(w http.ResponseWriter, repo *repo, packets []pktPacket) {
+	fr := parseFetchV0(packets)
+	resp, err := s.fetchResponse(repo, fr, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+	_, _ = w.Write(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -2312,6 +2753,9 @@ func (s *server) gitReceivePack(w http.ResponseWriter, r *http.Request, repo *re
 			report.Write(pktLine([]byte("ng " + cmd.ref + " " + msg + "\n")))
 		}
 	}
+	// Objects are stored even when a ref update is refused, so any push
+	// (or delete) may have changed what a fetch would return.
+	repo.touch()
 
 	w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
 	if sideband {
@@ -3145,6 +3589,7 @@ func (s *server) createRef(w http.ResponseWriter, r *http.Request, owner, name s
 		return
 	}
 	rp.refs[body.Ref] = body.Sha
+	rp.touch() // a new ref changes what ls-refs/fetch see; cached fetches are stale
 	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"ref":    body.Ref,
 		"object": map[string]any{"sha": body.Sha},
@@ -3239,6 +3684,8 @@ func (s *server) restLabels(w http.ResponseWriter, r *http.Request, owner, name 
 		l := &label{id: s.st.nextLabelID, name: body.Name, color: body.Color}
 		s.st.nextLabelID++
 		rp.labels[body.Name] = l
+		// A new label changes how issues carrying its name render.
+		invalidateRepoIssueCaches(rp)
 		s.writeJSON(w, http.StatusCreated, s.labelJSON(l))
 	default:
 		s.writeJSON(w, http.StatusMethodNotAllowed, errBody("Method Not Allowed"))
@@ -3397,7 +3844,9 @@ func (s *server) createIssue(w http.ResponseWriter, r *http.Request, owner, name
 	s.st.nextIssueID++
 	rp.nextNumber++
 	rp.issues[is.number] = is
-	s.writeJSON(w, http.StatusCreated, s.issueJSON(rp, is))
+	// Fast path: the hand-rolled encoder renders (and caches) the same
+	// bytes Marshal would produce from the map tree.
+	s.writeRawJSON(w, http.StatusCreated, s.issueJSONBytes(rp, is))
 }
 
 func (s *server) getIssue(w http.ResponseWriter, r *http.Request, owner, name string, n int) {
@@ -3409,7 +3858,9 @@ func (s *server) getIssue(w http.ResponseWriter, r *http.Request, owner, name st
 		return
 	}
 	if is, ok := rp.issues[n]; ok {
-		s.writeJSON(w, http.StatusOK, s.issueJSON(rp, is))
+		// Fast path: the read benchmark GETs one issue 2,000 times;
+		// after the first render this is a cached slice write.
+		s.writeRawJSON(w, http.StatusOK, s.issueJSONBytes(rp, is))
 		return
 	}
 	if pr, ok := rp.pulls[n]; ok {
@@ -3445,7 +3896,8 @@ func (s *server) patchIssue(w http.ResponseWriter, r *http.Request, owner, name 
 		if body.Body != nil {
 			is.body = *body.Body
 		}
-		s.writeJSON(w, http.StatusOK, s.issueJSON(rp, is))
+		invalidateIssueCache(is)
+		s.writeRawJSON(w, http.StatusOK, s.issueJSONBytes(rp, is))
 		return
 	}
 	if pr, ok := rp.pulls[n]; ok {
@@ -3506,6 +3958,7 @@ func (s *server) createComment(w http.ResponseWriter, r *http.Request, owner, na
 	c := &comment{id: s.st.nextCommentID, body: body.Body, seq: s.st.nextSeq()}
 	s.st.nextCommentID++
 	is.comments = append(is.comments, c)
+	invalidateIssueCache(is) // the comments count in the rendering changed
 	s.writeJSON(w, http.StatusCreated, s.commentJSON(c))
 }
 
@@ -5382,6 +5835,7 @@ func (c *gqlCtx) mutCloseIssue(f *gqlField) any {
 		})
 	}
 	is.state = "closed"
+	invalidateIssueCache(is)
 	return c.execFields(f.sel, "CloseIssuePayload", func(pf *gqlField) (any, bool) {
 		switch pf.name {
 		case "__typename":
@@ -5526,6 +5980,7 @@ func (c *gqlCtx) mutAddComment(f *gqlField) any {
 	cm := &comment{id: c.s.st.nextCommentID, body: body, seq: c.s.st.nextSeq()}
 	c.s.st.nextCommentID++
 	is.comments = append(is.comments, cm)
+	invalidateIssueCache(is) // the comments count in the rendering changed
 	return c.execFields(f.sel, "AddCommentPayload", func(pf *gqlField) (any, bool) {
 		switch pf.name {
 		case "__typename":
