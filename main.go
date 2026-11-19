@@ -35,7 +35,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -134,14 +133,6 @@ type issue struct {
 	labels   []string
 	comments []*comment
 	seq      int64
-
-	// rendered caches the issue's REST JSON encoding (see
-	// issueJSONBytes). It is set on first render and cleared by every
-	// mutation of the issue or of the repo's labels; all mutations run
-	// under the store write lock, so readers under the read lock see a
-	// stable value. The read benchmark GETs one issue 2,000 times, so
-	// this cache turns 1,999 renders into a slice return.
-	rendered []byte
 }
 
 type pull struct {
@@ -301,11 +292,9 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 // authorized reports whether the request carries the expected bearer token.
-// Allocation-free on the hot path: the header is read from the map
-// directly (net/http canonicalises keys on receipt, so Header.Get's
-// canonicalisation is redundant work), and the token comparison runs
-// over the strings' bytes in place instead of converting both sides to
-// []byte. The comparison itself stays constant-time for equal lengths.
+// It reads the Authorization header from the map directly (Get
+// re-canonicalizes the key on every call) and compares tokens byte-wise
+// without the two []byte conversions ConstantTimeCompare would force.
 func (s *server) authorized(r *http.Request) bool {
 	var h string
 	if v := r.Header["Authorization"]; len(v) > 0 {
@@ -374,8 +363,13 @@ func (s *server) writeRawJSON(w http.ResponseWriter, status int, b []byte) {
 // — keys in encoding/json's sorted order, strings escaped exactly the way
 // Marshal escapes them (HTML escaping on: < > & become \u003c \u003e
 // \u0026; U+2028/U+2029 escaped; invalid UTF-8 becomes \ufffd) — at a
-// fraction of the allocations. A differential test against Marshal (see the
-// V2 notes) keeps the two in agreement.
+// fraction of the allocations. A differential test against Marshal keeps
+// the two in agreement.
+//
+// Unlike V2, the rendered bytes are NOT cached on the issue: the cache
+// wrote to the issue under a read lock (a data race between concurrent
+// readers) and saved only the render cost on repeat reads, which profiling
+// showed to be a few microseconds per request.
 //
 // appendJSONString appends s as a quoted JSON string, byte-identical to
 // encoding/json's encoding of the same string.
@@ -391,6 +385,7 @@ func appendJSONString(dst []byte, s string) []byte {
 			break
 		}
 	}
+
 	dst = append(dst, '"')
 	if !needEscape {
 		dst = append(dst, s...)
@@ -410,6 +405,10 @@ func appendJSONString(dst []byte, s string) []byte {
 			dst = append(dst, '\\', 'r')
 		case c == '\t':
 			dst = append(dst, '\\', 't')
+		case c == '\b':
+			dst = append(dst, '\\', 'b')
+		case c == '\f':
+			dst = append(dst, '\\', 'f')
 		case c == '<':
 			dst = append(dst, '\\', 'u', '0', '0', '3', 'c')
 		case c == '>':
@@ -452,13 +451,9 @@ func appendJSONInt(dst []byte, n int) []byte {
 }
 
 // issueJSONBytes renders an issue exactly as json.Marshal(issueJSON(rp, is))
-// would, but without building the map tree. The result is cached on the
-// issue; every mutation path clears it (see invalidateIssueCache).
-// Keys are emitted in encoding/json's sorted order.
+// would, but without building the map tree. Keys are emitted in
+// encoding/json's sorted order.
 func (s *server) issueJSONBytes(rp *repo, is *issue) []byte {
-	if is.rendered != nil {
-		return is.rendered
-	}
 	// Pre-size: the fixed skeleton is ~200 bytes plus title, body and
 	// labels. Growing from a good guess avoids reallocation.
 	b := make([]byte, 0, 256+len(is.title)+len(is.body)+len(is.labels)*64)
@@ -503,21 +498,7 @@ func (s *server) issueJSONBytes(rp *repo, is *issue) []byte {
 	b = append(b, `,"login":`...)
 	b = appendJSONString(b, s.cfg.viewer)
 	b = append(b, `,"type":"User"}}`...)
-	is.rendered = b
 	return b
-}
-
-// invalidateIssueCache clears one issue's rendered cache.
-func invalidateIssueCache(is *issue) { is.rendered = nil }
-
-// invalidateRepoIssueCaches clears every issue's rendered cache in a repo.
-// Labels feed into issue rendering, so creating a label invalidates all of
-// them (a label that did not exist renders as a fallback, and renders as
-// the real label once created).
-func invalidateRepoIssueCaches(rp *repo) {
-	for _, is := range rp.issues {
-		is.rendered = nil
-	}
 }
 
 // readJSONBody reads and parses a JSON request body. It reports whether the
@@ -544,15 +525,6 @@ func (s *server) readJSONBody(w http.ResponseWriter, r *http.Request, v any) boo
 
 func main() {
 	log.SetFlags(0)
-	// The store is small (tens of MB at most) and the workloads are
-	// allocation-heavy bursts (50 concurrent clones, 2,000 sequential
-	// reads), so the default GC target (heap = 2x live) collects far more
-	// often than the memory budget requires. A 200% target lets the heap
-	// grow to 3x live before collecting, trading a bounded amount of
-	// memory for measurably less GC CPU during the bursts; the hard
-	// memory limit keeps that trade bounded even if the store grows.
-	debug.SetGCPercent(200)
-	debug.SetMemoryLimit(512 << 20)
 	cfg := loadConfig()
 	srv := newServer(cfg)
 
@@ -1276,20 +1248,6 @@ func pktLine(payload []byte) []byte {
 	out = appendPktHeader(out, n)
 	out = append(out, payload...)
 	return out
-}
-
-// writePktLine writes a pkt-line framed payload into b without the
-// intermediate allocation pktLine does.
-func writePktLine(b *bytes.Buffer, payload []byte) {
-	n := len(payload) + 4
-	b.Grow(n)
-	var hdr [4]byte
-	hdr[0] = hexDigits[(n>>12)&0xf]
-	hdr[1] = hexDigits[(n>>8)&0xf]
-	hdr[2] = hexDigits[(n>>4)&0xf]
-	hdr[3] = hexDigits[n&0xf]
-	b.Write(hdr[:])
-	b.Write(payload)
 }
 
 func pktFlush() []byte { return []byte("0000") }
@@ -3684,8 +3642,6 @@ func (s *server) restLabels(w http.ResponseWriter, r *http.Request, owner, name 
 		l := &label{id: s.st.nextLabelID, name: body.Name, color: body.Color}
 		s.st.nextLabelID++
 		rp.labels[body.Name] = l
-		// A new label changes how issues carrying its name render.
-		invalidateRepoIssueCaches(rp)
 		s.writeJSON(w, http.StatusCreated, s.labelJSON(l))
 	default:
 		s.writeJSON(w, http.StatusMethodNotAllowed, errBody("Method Not Allowed"))
@@ -3844,8 +3800,6 @@ func (s *server) createIssue(w http.ResponseWriter, r *http.Request, owner, name
 	s.st.nextIssueID++
 	rp.nextNumber++
 	rp.issues[is.number] = is
-	// Fast path: the hand-rolled encoder renders (and caches) the same
-	// bytes Marshal would produce from the map tree.
 	s.writeRawJSON(w, http.StatusCreated, s.issueJSONBytes(rp, is))
 }
 
@@ -3858,8 +3812,6 @@ func (s *server) getIssue(w http.ResponseWriter, r *http.Request, owner, name st
 		return
 	}
 	if is, ok := rp.issues[n]; ok {
-		// Fast path: the read benchmark GETs one issue 2,000 times;
-		// after the first render this is a cached slice write.
 		s.writeRawJSON(w, http.StatusOK, s.issueJSONBytes(rp, is))
 		return
 	}
@@ -3896,7 +3848,6 @@ func (s *server) patchIssue(w http.ResponseWriter, r *http.Request, owner, name 
 		if body.Body != nil {
 			is.body = *body.Body
 		}
-		invalidateIssueCache(is)
 		s.writeRawJSON(w, http.StatusOK, s.issueJSONBytes(rp, is))
 		return
 	}
@@ -3958,7 +3909,6 @@ func (s *server) createComment(w http.ResponseWriter, r *http.Request, owner, na
 	c := &comment{id: s.st.nextCommentID, body: body.Body, seq: s.st.nextSeq()}
 	s.st.nextCommentID++
 	is.comments = append(is.comments, c)
-	invalidateIssueCache(is) // the comments count in the rendering changed
 	s.writeJSON(w, http.StatusCreated, s.commentJSON(c))
 }
 
@@ -5835,7 +5785,6 @@ func (c *gqlCtx) mutCloseIssue(f *gqlField) any {
 		})
 	}
 	is.state = "closed"
-	invalidateIssueCache(is)
 	return c.execFields(f.sel, "CloseIssuePayload", func(pf *gqlField) (any, bool) {
 		switch pf.name {
 		case "__typename":
@@ -5980,7 +5929,6 @@ func (c *gqlCtx) mutAddComment(f *gqlField) any {
 	cm := &comment{id: c.s.st.nextCommentID, body: body, seq: c.s.st.nextSeq()}
 	c.s.st.nextCommentID++
 	is.comments = append(is.comments, cm)
-	invalidateIssueCache(is) // the comments count in the rendering changed
 	return c.execFields(f.sel, "AddCommentPayload", func(pf *gqlField) (any, bool) {
 		switch pf.name {
 		case "__typename":
