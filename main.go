@@ -21,6 +21,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
@@ -33,6 +34,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"sort"
@@ -228,7 +230,6 @@ func repoKey(owner, name string) string { return owner + "/" + name }
 type server struct {
 	cfg   config
 	st    *store
-	mux   *http.ServeMux
 	reqID uint64 // atomic counter for X-GitHub-Request-Id
 
 	// mcpToolsJSON is the tools/list result, marshalled once so two calls
@@ -237,8 +238,7 @@ type server struct {
 }
 
 func newServer(cfg config) *server {
-	s := &server{cfg: cfg, st: newStore(), mux: http.NewServeMux()}
-	s.mux.HandleFunc("/", s.route)
+	s := &server{cfg: cfg, st: newStore()}
 	s.mcpToolsJSON = marshalJSON(mcpToolsResult())
 	return s
 }
@@ -523,6 +523,558 @@ func (s *server) readJSONBody(w http.ResponseWriter, r *http.Request, v any) boo
 // ---------------------------------------------------------------------------
 // lifecycle: register with the env, serve, poll /done
 
+// ---------------------------------------------------------------------------
+// hand-rolled HTTP/1.1 server (V4)
+//
+// V3's pprof profile under the read workload showed the handler logic
+// (store lookup + hand-rolled JSON) is negligible: the cost is net/http's
+// per-connection machinery (background read goroutine, bufio, the response
+// state machine) plus syscall and scheduler overhead. This server replaces
+// net/http's server with one goroutine per connection, a tight request
+// parser, and one writev per response (headers + body in a single syscall).
+//
+// It speaks HTTP/1.1 (and 1.0): keep-alive, Content-Length and chunked
+// request bodies, Expect: 100-continue, pipelining. It builds a standard
+// *http.Request and calls the same route handler, so behavior is identical
+// to the net/http server; only the transport changes.
+
+// maxRequestBody is the guardrail on a request body. The suite's largest
+// body is the ~200 KiB clone-history push; anything past this is refused
+// with 413 rather than buffered without bound.
+const maxRequestBody = 128 << 20
+
+// maxHeaderBytes caps the request line + headers, like net/http's
+// DefaultMaxHeaderBytes.
+const maxHeaderBytes = 1 << 20
+
+// fastServer serves the forge over raw TCP.
+type fastServer struct {
+	srv *server
+
+	mu     sync.Mutex
+	ln     net.Listener
+	conns  map[net.Conn]struct{}
+	closed bool
+}
+
+func newFastServer(srv *server) *fastServer {
+	return &fastServer{srv: srv, conns: make(map[net.Conn]struct{})}
+}
+
+// Serve accepts connections until the listener closes.
+func (fs *fastServer) Serve(ln net.Listener) error {
+	fs.mu.Lock()
+	fs.ln = ln
+	fs.mu.Unlock()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
+		fs.mu.Lock()
+		if fs.closed {
+			fs.mu.Unlock()
+			c.Close()
+			continue
+		}
+		fs.conns[c] = struct{}{}
+		fs.mu.Unlock()
+		go fs.serveConn(c)
+	}
+}
+
+// Close stops the listener and all active connections.
+func (fs *fastServer) Close() error {
+	fs.mu.Lock()
+	fs.closed = true
+	for c := range fs.conns {
+		c.Close()
+	}
+	ln := fs.ln
+	fs.mu.Unlock()
+	if ln != nil {
+		return ln.Close()
+	}
+	return nil
+}
+
+// fastResponseWriter buffers one response (status, headers, body) so the
+// server can emit it in a single writev. No handler streams, flushes or
+// hijacks, so buffering the whole response is safe.
+type fastResponseWriter struct {
+	header http.Header
+	status int
+	body   []byte
+}
+
+func (w *fastResponseWriter) Header() http.Header { return w.header }
+
+func (w *fastResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *fastResponseWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	w.body = append(w.body, b...)
+	return len(b), nil
+}
+
+func (w *fastResponseWriter) reset() {
+	clear(w.header)
+	w.status = 0
+	w.body = w.body[:0]
+}
+
+// cachedDate is the IMF-fixdate for the current second, refreshed lazily:
+// formatting the date per response costs more than the rest of the response
+// header. Two goroutines may race to refresh it; both write the same value.
+var cachedDate atomic.Value // string
+var cachedDateSec atomic.Int64
+
+func httpDate() string {
+	now := time.Now()
+	sec := now.Unix()
+	if cachedDateSec.Load() == sec {
+		if s, ok := cachedDate.Load().(string); ok && s != "" {
+			return s
+		}
+	}
+	s := now.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	cachedDate.Store(s)
+	cachedDateSec.Store(sec)
+	return s
+}
+
+// reasonPhrase returns the reason for a status code. The map covers every
+// status the handlers emit; anything else falls back to http.StatusText.
+func reasonPhrase(status int) string {
+	switch status {
+	case 200:
+		return "OK"
+	case 201:
+		return "Created"
+	case 202:
+		return "Accepted"
+	case 204:
+		return "No Content"
+	case 400:
+		return "Bad Request"
+	case 401:
+		return "Unauthorized"
+	case 404:
+		return "Not Found"
+	case 405:
+		return "Method Not Allowed"
+	case 409:
+		return "Conflict"
+	case 422:
+		return "Unprocessable Entity"
+	default:
+		return http.StatusText(status)
+	}
+}
+
+// fastConn holds the per-connection state, reused across keep-alive
+// requests so the steady state allocates nothing per request.
+type fastConn struct {
+	c      net.Conn
+	br     *bufio.Reader
+	remote string
+
+	req    http.Request
+	hdr    http.Header
+	rw     fastResponseWriter
+	body   []byte // scratch request-body buffer
+	hdrBuf []byte // scratch response-header buffer
+	line   []byte // scratch for over-long lines
+}
+
+func (fs *fastServer) serveConn(c net.Conn) {
+	defer func() {
+		fs.mu.Lock()
+		delete(fs.conns, c)
+		fs.mu.Unlock()
+		c.Close()
+	}()
+	fc := &fastConn{
+		c:      c,
+		br:     bufio.NewReaderSize(c, 4096),
+		remote: c.RemoteAddr().String(),
+		hdr:    make(http.Header, 8),
+	}
+	fc.rw.header = make(http.Header, 4)
+	for {
+		keepAlive, ok := fc.readRequest()
+		if !ok {
+			return
+		}
+		fc.rw.reset()
+		fs.srv.route(&fc.rw, &fc.req)
+		if !fc.writeResponse(keepAlive) {
+			return
+		}
+		if !keepAlive {
+			return
+		}
+	}
+}
+
+// readLine reads one LF-terminated line. The common case returns a slice
+// into the buffer (no allocation); a line longer than the buffer is
+// accumulated into fc.line. The trailing \r\n (or \n) is stripped.
+func (fc *fastConn) readLine() ([]byte, error) {
+	frag, err := fc.br.ReadSlice('\n')
+	if err == nil {
+		return trimLineEnd(frag), nil
+	}
+	if err != bufio.ErrBufferFull {
+		return nil, err
+	}
+	// Long line: accumulate.
+	fc.line = append(fc.line[:0], frag...)
+	for {
+		frag, err := fc.br.ReadSlice('\n')
+		fc.line = append(fc.line, frag...)
+		if err == nil {
+			return trimLineEnd(fc.line), nil
+		}
+		if err != bufio.ErrBufferFull {
+			return nil, err
+		}
+		if len(fc.line) > maxHeaderBytes {
+			return nil, errLineTooLong
+		}
+	}
+}
+
+var errLineTooLong = fmt.Errorf("line too long")
+
+func trimLineEnd(b []byte) []byte {
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
+		if n := len(b); n > 0 && b[n-1] == '\r' {
+			b = b[:n-1]
+		}
+	}
+	return b
+}
+
+// hasToken reports whether a comma-separated header value holds token
+// (case-insensitive), e.g. "close" in "Keep-Alive, Close".
+func hasToken(v, token string) bool {
+	for {
+		i := strings.IndexByte(v, ',')
+		var field string
+		if i < 0 {
+			field = v
+		} else {
+			field = v[:i]
+		}
+		if strings.EqualFold(strings.TrimSpace(field), token) {
+			return true
+		}
+		if i < 0 {
+			return false
+		}
+		v = v[i+1:]
+	}
+}
+
+// readRequest reads one request into fc.req. It returns (keepAlive, true)
+// on success; on any failure (EOF, malformed request, oversized body) it
+// returns false and the connection must close.
+func (fc *fastConn) readRequest() (bool, bool) {
+	// Request line: METHOD SP TARGET SP HTTP/x.y
+	line, err := fc.readLine()
+	if err != nil {
+		return false, false
+	}
+	sp1 := bytes.IndexByte(line, ' ')
+	if sp1 < 0 {
+		return false, false
+	}
+	sp2 := bytes.IndexByte(line[sp1+1:], ' ')
+	if sp2 < 0 {
+		return false, false
+	}
+	sp2 += sp1 + 1
+	method := string(line[:sp1])
+	target := string(line[sp1+1 : sp2])
+	proto := string(line[sp2+1:])
+	if method == "" || target == "" {
+		return false, false
+	}
+	version11 := proto == "HTTP/1.1"
+	version10 := proto == "HTTP/1.0"
+	if !version11 && !version10 {
+		return false, false
+	}
+
+	// Headers.
+	clear(fc.hdr)
+	var host string
+	var contentLength int64 = -1
+	var chunked, expectContinue bool
+	var connClose, connKeepAlive bool
+	headerBytes := len(line)
+	for {
+		line, err := fc.readLine()
+		if err != nil {
+			return false, false
+		}
+		headerBytes += len(line) + 2
+		if headerBytes > maxHeaderBytes {
+			return false, false
+		}
+		if len(line) == 0 {
+			break // end of headers
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			return false, false // obs-fold: rejected, like net/http
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 {
+			return false, false
+		}
+		name := textproto.CanonicalMIMEHeaderKey(string(line[:colon]))
+		value := string(bytes.Trim(line[colon+1:], " \t"))
+		fc.hdr[name] = append(fc.hdr[name], value)
+		switch name {
+		case "Host":
+			host = value
+		case "Content-Length":
+			if contentLength >= 0 {
+				return false, false // duplicate Content-Length: rejected
+			}
+			n, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || n < 0 {
+				return false, false
+			}
+			contentLength = n
+		case "Transfer-Encoding":
+			if hasToken(value, "chunked") {
+				chunked = true
+			}
+		case "Expect":
+			if strings.EqualFold(value, "100-continue") {
+				expectContinue = true
+			}
+		case "Connection":
+			if hasToken(value, "close") {
+				connClose = true
+			}
+			if hasToken(value, "keep-alive") {
+				connKeepAlive = true
+			}
+		}
+	}
+	if version11 && host == "" {
+		// HTTP/1.1 requires Host; net/http rejects its absence.
+		return false, false
+	}
+
+	// Body.
+	body, ok := fc.readBody(contentLength, chunked, expectContinue, version11)
+	if !ok {
+		return false, false
+	}
+
+	// Build the request. ParseRequestURI matches net/http's server-side
+	// target parsing exactly (origin-form and absolute-form).
+	u, err := url.ParseRequestURI(target)
+	if err != nil {
+		return false, false
+	}
+	fc.req = http.Request{
+		Method:        method,
+		URL:           u,
+		Proto:         proto,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        fc.hdr,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		Host:          host,
+		RemoteAddr:    fc.remote,
+		RequestURI:    target,
+		ContentLength: int64(len(body)),
+	}
+	if version10 {
+		fc.req.ProtoMinor = 0
+	}
+	keepAlive := (version11 && !connClose) || (version10 && connKeepAlive)
+	return keepAlive, true
+}
+
+// readBody reads the request body per Content-Length or chunked framing.
+// With Expect: 100-continue it sends the interim response first (git's
+// curl client waits for it before sending a large pack).
+func (fc *fastConn) readBody(contentLength int64, chunked, expectContinue, version11 bool) ([]byte, bool) {
+	if expectContinue && version11 {
+		if _, err := fc.c.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n")); err != nil {
+			return nil, false
+		}
+	}
+	if chunked {
+		return fc.readChunkedBody()
+	}
+	if contentLength <= 0 {
+		return nil, true
+	}
+	if contentLength > maxRequestBody {
+		return nil, false
+	}
+	fc.body = fc.body[:0]
+	for int64(len(fc.body)) < contentLength {
+		// Grow the scratch buffer incrementally (doubling), never
+		// allocating the full declared length up front.
+		need := contentLength - int64(len(fc.body))
+		if int64(cap(fc.body)-len(fc.body)) < need {
+			newCap := cap(fc.body) * 2
+			if newCap < 32<<10 {
+				newCap = 32 << 10
+			}
+			if int64(newCap) > contentLength {
+				newCap = int(contentLength)
+			}
+			nb := make([]byte, len(fc.body), newCap)
+			copy(nb, fc.body)
+			fc.body = nb
+		}
+		n, err := fc.br.Read(fc.body[len(fc.body):cap(fc.body)])
+		if n > 0 {
+			fc.body = fc.body[:len(fc.body)+n]
+		}
+		if err != nil {
+			return nil, false
+		}
+	}
+	return fc.body, true
+}
+
+// readChunkedBody reads a chunked request body (trailers ignored).
+func (fc *fastConn) readChunkedBody() ([]byte, bool) {
+	fc.body = fc.body[:0]
+	for {
+		line, err := fc.readLine()
+		if err != nil {
+			return nil, false
+		}
+		// Chunk size in hex; extensions after ';' are ignored.
+		if i := bytes.IndexByte(line, ';'); i >= 0 {
+			line = line[:i]
+		}
+		size, err := strconv.ParseInt(string(bytes.TrimSpace(line)), 16, 64)
+		if err != nil || size < 0 {
+			return nil, false
+		}
+		if size == 0 {
+			// Trailers until an empty line.
+			for {
+				line, err := fc.readLine()
+				if err != nil {
+					return nil, false
+				}
+				if len(line) == 0 {
+					return fc.body, true
+				}
+			}
+		}
+		if int64(len(fc.body))+size > maxRequestBody {
+			return nil, false
+		}
+		start := len(fc.body)
+		if cap(fc.body)-len(fc.body) < int(size) {
+			nb := make([]byte, len(fc.body), len(fc.body)+int(size))
+			copy(nb, fc.body)
+			fc.body = nb
+		}
+		fc.body = fc.body[:start+int(size)]
+		if _, err := io.ReadFull(fc.br, fc.body[start:]); err != nil {
+			return nil, false
+		}
+		// Chunk-terminating CRLF.
+		crlf := make([]byte, 2)
+		if _, err := io.ReadFull(fc.br, crlf); err != nil || crlf[0] != '\r' || crlf[1] != '\n' {
+			return nil, false
+		}
+	}
+}
+
+// writeResponse serializes the buffered response and emits it in one
+// writev (headers + body in a single syscall). It returns false when the
+// write fails and the connection must close.
+func (fc *fastConn) writeResponse(keepAlive bool) bool {
+	status := fc.rw.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	body := fc.rw.body
+	head := fc.req.Method == http.MethodHead
+	noBody := status == http.StatusNoContent || status == http.StatusNotModified
+
+	// Sniff a Content-Type when the handler wrote a body without one,
+	// exactly as net/http does.
+	if len(body) > 0 && fc.rw.header.Get("Content-Type") == "" {
+		fc.rw.header.Set("Content-Type", http.DetectContentType(body))
+	}
+
+	hb := fc.hdrBuf[:0]
+	hb = append(hb, fc.req.Proto...)
+	hb = append(hb, ' ')
+	hb = strconv.AppendInt(hb, int64(status), 10)
+	if reason := reasonPhrase(status); reason != "" {
+		hb = append(hb, ' ')
+		hb = append(hb, reason...)
+	}
+	hb = append(hb, '\r', '\n')
+	// Handler headers, sorted like net/http writes them. Content-Length
+	// and Date are computed below, never taken from the handler.
+	keys := make([]string, 0, len(fc.rw.header))
+	for k := range fc.rw.header {
+		if k == "Content-Length" || k == "Date" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		for _, v := range fc.rw.header[k] {
+			hb = append(hb, k...)
+			hb = append(hb, ':', ' ')
+			hb = append(hb, v...)
+			hb = append(hb, '\r', '\n')
+		}
+	}
+	hb = append(hb, "Date: "...)
+	hb = append(hb, httpDate()...)
+	hb = append(hb, '\r', '\n')
+	if !noBody {
+		hb = append(hb, "Content-Length: "...)
+		hb = strconv.AppendInt(hb, int64(len(body)), 10)
+		hb = append(hb, '\r', '\n')
+	}
+	if !keepAlive {
+		hb = append(hb, "Connection: close\r\n"...)
+	}
+	hb = append(hb, '\r', '\n')
+	fc.hdrBuf = hb
+
+	if noBody || head {
+		_, err := fc.c.Write(hb)
+		return err == nil
+	}
+	bufs := net.Buffers{hb, body}
+	_, err := bufs.WriteTo(fc.c)
+	return err == nil
+}
+
 func main() {
 	log.SetFlags(0)
 	cfg := loadConfig()
@@ -541,29 +1093,24 @@ func main() {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	httpSrv := &http.Server{
-		Handler:      srv.mux,
-		ReadTimeout:  0, // long-lived git streams; the suite enforces its own deadlines
-		WriteTimeout: 0,
-		IdleTimeout:  0,
-	}
+	fastSrv := newFastServer(srv)
 
 	if cfg.envURL != "" {
 		go func() {
-			_ = httpSrv.Serve(ln)
+			_ = fastSrv.Serve(ln)
 		}()
 		if err := registerWithEnv(cfg.envURL, port); err != nil {
 			log.Fatalf("register: %v", err)
 		}
 		log.Printf("registered on port %d, polling %s/done", port, cfg.envURL)
 		pollDone(cfg.envURL)
-		_ = httpSrv.Close()
+		_ = fastSrv.Close()
 		os.Exit(0)
 	}
 
 	// Standalone mode (local testing).
 	fmt.Printf("READY\nListening on http://0.0.0.0:%d\n", port)
-	log.Fatal(httpSrv.Serve(ln))
+	log.Fatal(fastSrv.Serve(ln))
 }
 
 func registerWithEnv(envURL string, port int) error {
